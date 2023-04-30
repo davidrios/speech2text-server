@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import tempfile
 import typing as t
@@ -8,6 +9,8 @@ from queue import Empty, SimpleQueue
 
 import ffmpeg  # type:ignore
 from fastapi import FastAPI
+
+log = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -156,7 +159,14 @@ def read_item(item_id: int, q: str | None = None):
 if os.environ.get("USE_GRADIO"):
     import gradio as gr
 
-    async def gradio_output(
+    use_async_iter = True
+    try:
+        from gradio.utils import SyncToAsyncIterator
+    except ImportError:
+        log.warn("** Your Gradio version doesn't support streaming responses. **")
+        use_async_iter = False
+
+    async def gradio_output_iterator(
         audio_mic: t.Any,
         audio_upload: t.Any,
     ) -> t.AsyncGenerator[str, None]:
@@ -211,8 +221,17 @@ if os.environ.get("USE_GRADIO"):
         progress = 100
         yield output + f"\n\n(Progress: {progress}%)"
 
+    async def gradio_output(
+        audio_mic: t.Any,
+        audio_upload: t.Any,
+    ) -> str:
+        res = ""
+        async for res in gradio_output_iterator(audio_mic, audio_upload):
+            continue
+        return res
+
     demo = gr.Interface(
-        gradio_output,
+        gradio_output_iterator if use_async_iter else gradio_output,
         inputs=[
             gr.Audio(source="microphone", label="", type="filepath"),
             gr.Audio(source="upload", label="", type="filepath"),
