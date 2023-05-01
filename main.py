@@ -15,8 +15,23 @@ log = logging.getLogger(__name__)
 app = FastAPI()
 
 
+TranscriptionStreamItem = str | float | None
+"""
+The item type defines what the partial result is:
+
+- `str`: A transcription snippet.
+- `float`: The current progress in percentage.
+- `None`: The process finished, no more results are coming.
+"""
+
+
 class TranscriberBase:
-    def transcribe(self, audio_file: str) -> t.AsyncGenerator[str | int | None, None]:
+    def transcribe(
+        self, audio_file: str
+    ) -> t.AsyncGenerator[TranscriptionStreamItem, None]:
+        """
+        Implement a generator that streams the results of the transcription.
+        """
         raise NotImplementedError
 
 
@@ -54,16 +69,16 @@ class TranscriptionProcessor:
         num_instances: int = 1,
     ):
         self.queue: Queue[tuple[int, str]] = Queue(num_instances)
-        self.results: dict[int, Queue[str | int | None]] = {}
-        self.id = 0
+        self.results: dict[int, Queue[TranscriptionStreamItem]] = {}
+        self.last_job_id = 0
         self.transcribers = [transcriber_factory() for _ in range(num_instances)]
         self.num_instances = num_instances
         self.running_tasks = []
 
     async def process(self, audio_file: str):
-        self.id += 1
-        key = self.id
-        res_queue: Queue[str | int | None] = Queue()
+        self.last_job_id += 1
+        key = self.last_job_id
+        res_queue: Queue[TranscriptionStreamItem] = Queue()
         self.results[key] = res_queue
         await self.queue.put((key, audio_file))
         return res_queue
@@ -119,7 +134,7 @@ else:
 
     class WhisperCppTranscriber(TranscriberBase):
         def __init__(self):
-            self._queue: SimpleQueue[str | int | None] = SimpleQueue()
+            self._queue: SimpleQueue[TranscriptionStreamItem] = SimpleQueue()
             self._transcript: list[str] = []
             num_threads = int(os.environ.get("WHISPER_CPP_THREADS") or -1)
             if num_threads == -1:
@@ -147,11 +162,11 @@ else:
                 segment += 1
 
         def on_progress(self, ctx: api.Context, progress: int, data: t.Any):
-            self._queue.put(progress)
+            self._queue.put(min(progress, 100) / 100)
 
         async def transcribe(
             self, audio_file: str
-        ) -> t.AsyncGenerator[str | int | None, None]:
+        ) -> t.AsyncGenerator[TranscriptionStreamItem, None]:
             async with ConvertedAudio(audio_file) as fname:
                 loop = get_running_loop()
                 future = loop.run_in_executor(None, self.w.transcribe_from_file, fname)
@@ -208,7 +223,7 @@ if os.environ.get("USE_GRADIO"):
         output += "** From microphone **\n"
         progress = 0
 
-        async def process_queue(queue: Queue[str | int | None]) -> bool:
+        async def process_queue(queue: Queue[TranscriptionStreamItem]) -> bool:
             nonlocal output
             nonlocal progress
 
@@ -216,8 +231,8 @@ if os.environ.get("USE_GRADIO"):
             if result is None:
                 return False
 
-            if isinstance(result, int):
-                progress = min(result, 100)
+            if isinstance(result, float):
+                progress = int(result * 100)
             else:
                 output += result
 
