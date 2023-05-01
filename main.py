@@ -94,11 +94,16 @@ else:
         def __init__(self):
             self._queue: SimpleQueue[str | int | None] = SimpleQueue()
             self._transcript: list[str] = []
+            num_threads = int(os.environ.get("WHISPER_CPP_THREADS") or -1)
+            if num_threads == -1:
+                num_threads = os.cpu_count() or 4
+
             params = (
                 api.Params.from_enum(api.SAMPLING_GREEDY)
                 .with_print_progress(False)
                 .with_print_realtime(False)
                 .with_suppress_blank(True)
+                .with_num_threads(num_threads)
                 .build()
             )
             self._progress: list[t.Any] = []
@@ -133,7 +138,9 @@ else:
                         await asyncio.sleep(0.1)
                 await future
 
-    transcribe_processor = TranscriptionProcessor(WhisperCppTranscriber, 1)
+    transcribe_processor = TranscriptionProcessor(
+        WhisperCppTranscriber, int(os.environ.get("WHISPER_CPP_INSTANCES") or 1)
+    )
 
 
 @app.on_event("startup")
@@ -240,4 +247,4 @@ if os.environ.get("USE_GRADIO"):
         allow_flagging="never",
     )
 
-    app = gr.mount_gradio_app(app, demo.queue(), path="/gradio")
+    app = gr.mount_gradio_app(app, demo.queue(concurrency_count=10), path="/gradio")
