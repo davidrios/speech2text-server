@@ -21,6 +21,33 @@ class TranscriberBase:
 
 
 class TranscriptionProcessor:
+    """
+    This class is designed to transcribe audio files using the provided `TranscriberBase`-derived
+    class. This class takes an audio file path as input and uses multiple instances of the
+    provided transcriber to run the transcription process concurrently.
+
+    The class constructor takes the following parameters:
+
+        `transcriber_factory`: A class that derives from `TranscriberBase` and provides the
+            `transcribe` method to perform the transcription. Multiple instances of this class
+            are created to concurrently run the transcription process.
+
+        `num_instances`: An optional parameter that specifies the number of transcriber
+            instances to create.
+
+    The `process` method takes an audio file path and returns an `asyncio.Queue` that the user
+    can use to read the results of the transcription process as they are generated.
+
+    The `_process_queue` method runs in a separate `asyncio` task for each transcriber instance
+    and dequeues an audio file from the queue, gets an available transcriber instance, and
+    starts the transcription process using the transcribe method of the transcriber
+    instance. It then stores the results in the appropriate queue and puts the transcriber
+    instance back in the pool.
+
+    The `start` method starts the transcription process by creating a task for each transcriber
+    instance to run the `_process_queue` method, and the stop method cancels all running tasks.
+    """
+
     def __init__(
         self,
         transcriber_factory: type[TranscriberBase],
@@ -198,7 +225,7 @@ if os.environ.get("USE_GRADIO"):
 
         yield output
         if audio_mic is None:
-            output += "** No audio **\n"
+            output += "** No audio **"
             yield output
         else:
             queue = await transcribe_processor.process(audio_mic)
@@ -208,13 +235,13 @@ if os.environ.get("USE_GRADIO"):
 
                 yield output + f"\n\n(Progress: {progress}%)"
 
-        output += "\n"
+        output += "\n\n"
         yield output
 
         output += "** From upload **\n"
         yield output
         if audio_upload is None:
-            output += "** No audio **\n"
+            output += "** No audio **"
             yield output
         else:
             progress = 0
