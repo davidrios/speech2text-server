@@ -317,6 +317,9 @@ else:
                         await asyncio.sleep(0.1)
                 await future
 
+        def stop(self):
+            return
+
     transcribe_processor = TranscriptionProcessor(
         WhisperCppTranscriber, int(os.environ.get("WHISPER_CPP_INSTANCES") or 1)
     )
