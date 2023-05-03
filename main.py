@@ -4,7 +4,6 @@ import os
 import tempfile
 import typing as t
 from asyncio import CancelledError, Queue, get_running_loop
-from base64 import b64decode
 from collections import Counter
 from enum import Enum
 from io import StringIO
@@ -13,9 +12,7 @@ from queue import Empty, SimpleQueue
 
 import aiofiles
 import ffmpeg  # type:ignore
-import msgpack
 from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
 
 log = logging.getLogger(__name__)
 log.setLevel(os.environ.get("LOG_LEVEL", "WARN"))
@@ -269,7 +266,8 @@ class ConvertedAudio:
         self.tmpdir.cleanup()
 
 
-if os.environ.get("ENGINE") == "openai":
+ENGINE = os.environ.get("ENGINE")
+if ENGINE == "openai":
     import openai
 
     def run_transcribe(model: str, file: t.BinaryIO) -> str:
@@ -290,6 +288,27 @@ if os.environ.get("ENGINE") == "openai":
             return
 
     transcribe_processor = TranscriptionProcessor(OpenAITranscriber, 1)
+elif ENGINE == "whisper":
+    import whisper
+
+    class WhisperTranscriber(TranscriberBase):
+        def __init__(self):
+            self._whisper = whisper.load_model(os.environ["MODEL"])
+
+        async def transcribe(
+            self, audio_file: str
+        ) -> t.AsyncGenerator[TranscriptionStreamItem, None]:
+            loop = get_running_loop()
+            result = await loop.run_in_executor(
+                None, self._whisper.transcribe, audio_file
+            )
+            yield result["text"]
+            yield 1.0
+
+        def stop(self):
+            return
+
+    transcribe_processor = TranscriptionProcessor(WhisperTranscriber, 1)
 else:
     from whispercpp import Whisper, api
 
@@ -316,7 +335,7 @@ else:
             self._progress: list[t.Any] = []
             params.on_progress(self.on_progress, self._progress)
 
-            self._whisper = Whisper.from_params(os.environ["MODEL_FILE"], params)
+            self._whisper = Whisper.from_params(os.environ["MODEL"], params)
             self._do_stop = False
 
         def on_new_segment(self, ctx: api.Context, n_new: int, data: list[str]):
@@ -530,10 +549,8 @@ if os.environ.get("USE_GRADIO"):
                 await stop_fns.pop()()
             log.debug("++++++++++++++ gradio output finished")
 
-    async def gradio_output(
-        audio_mic: t.Any,
-        audio_upload: t.Any,
-    ) -> str:
+    # typing here causes issues with gradio
+    async def gradio_output(audio_mic, audio_upload):  # type: ignore
         res = ""
         async for res in gradio_output_iterator(audio_mic, audio_upload):
             continue

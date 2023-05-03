@@ -1,0 +1,2 @@
+--extra-index-url https://download.pytorch.org/whl/cu117
+openai-whisper==20230314
