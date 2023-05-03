@@ -4,12 +4,18 @@ import os
 import tempfile
 import typing as t
 from asyncio import CancelledError, Queue, get_running_loop
+from base64 import b64decode
 from collections import Counter
+from enum import Enum
+from io import StringIO
 from pathlib import Path
 from queue import Empty, SimpleQueue
 
+import aiofiles
 import ffmpeg  # type:ignore
-from fastapi import FastAPI
+import msgpack
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse
 
 log = logging.getLogger(__name__)
 log.setLevel(os.environ.get("LOG_LEVEL", "WARN"))
@@ -97,6 +103,7 @@ class TranscriptionProcessor:
         self.result_queues: dict[int, Queue[TranscriptionStreamItem]] = {}
         self.cleanup_queue: Queue[int] = Queue()
         self.cleanup_delayed: Counter[int] = Counter()
+        self.to_stop: set[int] = set()
         self.last_job_id = 0
         self.running_tasks = []
 
@@ -110,7 +117,13 @@ class TranscriptionProcessor:
         self.result_queues[job_id] = result_queue
         await self.processing_queue.put((job_id, audio_file))
         log.debug("%s: put job in processing queue", job_id)
-        return result_queue
+
+        async def stop_fn():
+            log.debug("%s: requested to stop", job_id)
+            self.to_stop.add(job_id)
+            await self._schedule_cleanup(job_id)
+
+        return result_queue, stop_fn
 
     async def _process_queue(self):
         while True:
@@ -120,6 +133,11 @@ class TranscriptionProcessor:
                 result_queue = self.result_queues[job_id]
                 try:
                     async for stream_item in transcriber.transcribe(audio_file):
+                        if job_id in self.to_stop:
+                            transcriber.stop()
+                            log.debug("%s: stopped processing", job_id)
+                            break
+
                         log.debug("%s: put transcribe result in result queue", job_id)
                         await result_queue.put(stream_item)
                     await result_queue.put(None)
@@ -165,10 +183,17 @@ class TranscriptionProcessor:
         while True:
             try:
                 job_id = await self.cleanup_queue.get()
-                result_queue = self.result_queues[job_id]
+                try:
+                    result_queue = self.result_queues[job_id]
+                except KeyError:
+                    continue
 
-                if result_queue.empty():
+                if result_queue.empty() or job_id in self.to_stop:
                     del self.result_queues[job_id]
+                    try:
+                        self.to_stop.remove(job_id)
+                    except KeyError:
+                        pass
                     log.debug("%s: cleaned up", job_id)
                     continue
 
@@ -284,17 +309,21 @@ else:
                 .with_num_threads(num_threads)
                 .build()
             )
-            self._progress: list[t.Any] = []
+
+            self._transcript: list[str] = []
             params.on_new_segment(self.on_new_segment, self._transcript)
+
+            self._progress: list[t.Any] = []
             params.on_progress(self.on_progress, self._progress)
+
             self._whisper = Whisper.from_params(os.environ["MODEL_FILE"], params)
+            self._do_stop = False
 
         def on_new_segment(self, ctx: api.Context, n_new: int, data: list[str]):
             segment = ctx.full_n_segments() - n_new
             while segment < ctx.full_n_segments():
                 segment_text = ctx.full_get_segment_text(segment)
                 self._queue.put(segment_text)
-                data.append(segment_text)
                 segment += 1
 
         def on_progress(self, ctx: api.Context, progress: int, data: t.Any):
@@ -303,12 +332,18 @@ else:
         async def transcribe(
             self, audio_file: str
         ) -> t.AsyncGenerator[TranscriptionStreamItem, None]:
+            self._do_stop = False
+
             async with ConvertedAudio(audio_file) as fname:
                 loop = get_running_loop()
                 future = loop.run_in_executor(
                     None, self._whisper.transcribe_from_file, fname
                 )
                 while True:
+                    if self._do_stop:
+                        future.cancel()
+                        break
+
                     try:
                         yield self._queue.get_nowait()
                         if future.done() and self._queue.empty():
@@ -318,6 +353,8 @@ else:
                 await future
 
         def stop(self):
+            self._do_stop = True
+            # self._whisper
             return
 
     transcribe_processor = TranscriptionProcessor(
@@ -335,14 +372,80 @@ async def shutdown_event():
     transcribe_processor.stop()
 
 
+class MessageType(Enum):
+    TRANSCRIBE = "TRANSCRIBE"
+    PROCEED_WITH_FILE = "PROCEED_WITH_FILE"
+    TRANSCRIPT = "TRANSCRIPT"
+    TRANSCRIPTION_ERROR = "TRANSCRIPTION_ERROR"
+
+
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {"hello": "world"}
 
 
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: str | None = None):
-    return {"item_id": item_id, "q": q}
+async def process_transcribe_message(audio_data: bytes) -> t.Any:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_file = Path(tmpdir) / "input_file"
+        async with aiofiles.open(input_file, "wb") as afp:
+            await afp.write(audio_data)
+
+        queue, _ = await transcribe_processor.process(str(input_file))
+        progress = 0
+        content = StringIO()
+        while True:
+            result = await queue.get()
+            if result is None:
+                break
+
+            if isinstance(result, float):
+                progress = int(result * 100)
+                log.debug("progress %s%%", progress)
+            elif isinstance(result, TranscriptionError):
+                return {
+                    "type": MessageType.TRANSCRIPTION_ERROR.value,
+                    "content": str(result.original_exception),
+                }
+            else:
+                content.write(result)
+
+        content.seek(0)
+        return {
+            "type": MessageType.TRANSCRIPT.value,
+            "content": content.read(),
+        }
+
+
+@app.websocket("/api/transcribe")
+async def api_transcribe(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            message = await websocket.receive_json()
+            try:
+                msg_type = MessageType[message["type"]]
+            except KeyError:
+                log.debug("invalid message")
+                continue
+
+            if msg_type is MessageType.TRANSCRIBE:
+                try:
+                    await websocket.send_json(
+                        {"type": MessageType.PROCEED_WITH_FILE.value}
+                    )
+                    response = await process_transcribe_message(
+                        await websocket.receive_bytes()
+                    )
+                except:
+                    log.exception("error decoding transcribe message")
+                    continue
+
+                await websocket.send_json(response)
+            else:
+                log.debug("invalid message")
+                continue
+    finally:
+        pass
 
 
 if os.environ.get("USE_GRADIO"):
@@ -359,6 +462,7 @@ if os.environ.get("USE_GRADIO"):
         audio_mic: t.Any,
         audio_upload: t.Any,
     ) -> t.AsyncGenerator[str, None]:
+        stop_fns: list[t.Callable[..., t.Coroutine[t.Any, t.Any, None]]] = []
         try:
             output = ""
             output += "** From microphone **\n"
@@ -391,7 +495,8 @@ if os.environ.get("USE_GRADIO"):
                 output += "** No audio **"
                 yield output
             else:
-                queue = await transcribe_processor.process(audio_mic)
+                queue, stop_fn = await transcribe_processor.process(audio_mic)
+                stop_fns.append(stop_fn)
                 while True:
                     if not await process_queue(queue):
                         break
@@ -408,7 +513,9 @@ if os.environ.get("USE_GRADIO"):
                 yield output
             else:
                 progress = 0
-                queue = await transcribe_processor.process(audio_upload)
+                queue, stop_fn = await transcribe_processor.process(audio_upload)
+                log.debug("*************** %s %s", queue, stop_fn)
+                stop_fns.append(stop_fn)
                 while True:
                     if not await process_queue(queue):
                         break
@@ -417,11 +524,11 @@ if os.environ.get("USE_GRADIO"):
 
             progress = 100
             yield output + f"\n\n(Progress: {progress}%)"
-        except:
-            log.exception("gradio output exception")
-            raise
         finally:
-            log.debug("finished gradio output")
+            log.debug("################ %s", stop_fns)
+            while len(stop_fns) > 0:
+                await stop_fns.pop()()
+            log.debug("++++++++++++++ gradio output finished")
 
     async def gradio_output(
         audio_mic: t.Any,

@@ -1,2 +1,1 @@
-ffmpeg-python==0.2.0
 git+https://github.com/aarnphm/whispercpp.git
