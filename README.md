@@ -56,12 +56,6 @@ Uses the online OpenAI API platform. You'll need to
 [set up an account](https://platform.openai.com/signup), get an
 API key and set it in the `.env` file.
 
-Install the extra packages:
-
-```
-pip install -r requirements-openai.txt
-```
-
 
 ### Gradio test interface
 

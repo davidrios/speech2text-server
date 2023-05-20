@@ -1,0 +1,17 @@
+default: default
+profiles:
+  default:
+    name: Default
+    type: null
+  terminal:
+    name: Terminal
+    description: >
+      A profile that converts the input to shell commands.
+    type: openai
+    params:
+      model: text-davinci-003
+      prompt: >
+        You will interpret my message as a bash command. For instance, if I say
+        "remove dash f file" you'll output "rm -f file". Reply only the command,
+        nothing more. If you don't understand what I say answer "# I don't understand".
+        My message is:

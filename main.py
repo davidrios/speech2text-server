@@ -5,6 +5,7 @@ import tempfile
 import typing as t
 from asyncio import CancelledError, Queue, get_running_loop
 from collections import Counter
+from copy import deepcopy
 from enum import Enum
 from io import StringIO
 from pathlib import Path
@@ -12,13 +13,23 @@ from queue import Empty, SimpleQueue
 
 import aiofiles
 import ffmpeg  # type:ignore
+import openai
+import yaml
 from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 
 log = logging.getLogger(__name__)
 log.setLevel(os.environ.get("LOG_LEVEL", "WARN"))
 logging.basicConfig()
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class TranscriptionError(Exception):
@@ -268,20 +279,15 @@ class ConvertedAudio:
 
 ENGINE = os.environ.get("ENGINE")
 if ENGINE == "openai":
-    import openai
-
-    def run_transcribe(model: str, file: t.BinaryIO) -> str:
-        return openai.Audio.transcribe(  # type:ignore
-            model, file, response_format="text", language="en"
-        )
 
     class OpenAITranscriber(TranscriberBase):
         async def transcribe(
             self, audio_file: str
         ) -> t.AsyncGenerator[TranscriptionStreamItem, None]:
             with open(audio_file, "rb") as fp:
-                loop = get_running_loop()
-                yield await loop.run_in_executor(None, run_transcribe, "whisper-1", fp)
+                yield await openai.Audio.atranscribe(  # type:ignore
+                    "whisper-1", fp, response_format="text", language="en"
+                )
                 yield 1.0
 
         def stop(self):
@@ -431,8 +437,27 @@ async def process_transcribe_message(audio_data: bytes) -> t.Any:
         content.seek(0)
         return {
             "type": MessageType.TRANSCRIPT.value,
-            "content": content.read(),
+            "content": content.read().strip(),
         }
+
+
+def get_profiles_config() -> dict[str, t.Any]:
+    with open(os.environ["USE_PROFILES"]) as fp:
+        return yaml.load(fp, yaml.SafeLoader)
+
+
+async def process_by_profile(text: str, profile: str | None) -> str:
+    config = get_profiles_config()
+    profile_config = config["profiles"].get(
+        profile, config["profiles"][config["default"]]
+    )
+    if profile_config["type"] == "openai":
+        params = deepcopy(profile_config["params"])
+        params["prompt"] += text
+        res = await openai.Completion.acreate(**params)
+        if len(res["choices"]) > 0:
+            text = res["choices"][0]["text"].strip()
+    return text
 
 
 @app.websocket("/api/transcribe")
@@ -459,12 +484,22 @@ async def api_transcribe(websocket: WebSocket):
                     log.exception("error decoding transcribe message")
                     continue
 
+                if response["type"] == MessageType.TRANSCRIPT.value:
+                    response["content"] = await process_by_profile(
+                        response["content"], message.get("profile")
+                    )
+
                 await websocket.send_json(response)
             else:
                 log.debug("invalid message")
                 continue
     finally:
         pass
+
+
+@app.get("/api/profile")
+def get_profiles():
+    return get_profiles_config()
 
 
 if os.environ.get("USE_GRADIO"):

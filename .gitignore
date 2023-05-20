@@ -3,3 +3,4 @@
 .env
 __pycache__
 flagged
+profiles.yaml
