@@ -3,6 +3,20 @@ profiles:
   default:
     name: Default
     type: null
+  dictation:
+    name: Dictation support
+    description: >
+      A profile that also accepts dictation as input.
+    type: openai
+    params:
+      model: text-davinci-003
+      prompt: >
+        I'll give you an input, if it seems like it contains dictation, you'll convert the
+        dictated part to text, otherwise you'll pass the text unchanged. Note it could contain
+        dictation interspersed with normal text. Examples of dictation would be:
+        1. "THE Space. CHAR Space. B-O-M-B. Coma." which would be converted to "The char bomb.".
+        2. "THE Underline. OK Underline. F-O-M-R-M." would be converted to "the_ok_form".
+        My input is:
   terminal:
     name: Terminal
     description: >
@@ -11,7 +25,26 @@ profiles:
     params:
       model: text-davinci-003
       prompt: >
-        You will interpret my message as a bash command. For instance, if I say
+        You will interpret my input as a bash command. For instance, if I say
         "remove dash f file" you'll output "rm -f file". Reply only the command,
         nothing more. If you don't understand what I say answer "# I don't understand".
-        My message is:
+        My input is:
+  translate:
+    name: Translate to spanish
+    description: >
+      A profile that translates the input to spanish.
+    type: openai
+    params:
+      model: text-davinci-003
+      prompt: >
+        Translate to spanish:
+      max_tokens: 1000
+  gpt:
+    name: GPT prompt
+    description: >
+      Passes the input to text-davinci-003 and returns the result.
+    type: openai
+    params:
+      model: text-davinci-003
+      prompt: ""
+      max_tokens: 1000

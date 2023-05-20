@@ -15,7 +15,15 @@ import aiofiles
 import ffmpeg  # type:ignore
 import openai
 import yaml
-from fastapi import FastAPI, WebSocket
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 
 log = logging.getLogger(__name__)
@@ -409,7 +417,27 @@ def read_root():
     return {"hello": "world"}
 
 
-async def process_transcribe_message(audio_data: bytes) -> t.Any:
+def get_profiles_config() -> dict[str, t.Any]:
+    with open(os.environ["USE_PROFILES"]) as fp:
+        return yaml.load(fp, yaml.SafeLoader)
+
+
+async def process_by_profile(text: str, profile: str | None) -> str:
+    config = get_profiles_config()
+    profile_config = config["profiles"].get(
+        profile, config["profiles"][config["default"]]
+    )
+    if profile_config["type"] == "openai":
+        params = deepcopy(profile_config["params"])
+        params["prompt"] += text
+        res = await openai.Completion.acreate(**params)
+        log.debug("openai response: %s", res)
+        if len(res["choices"]) > 0:
+            text = res["choices"][0]["text"].strip()
+    return text
+
+
+async def process_transcribe_message(audio_data: bytes, profile: str | None) -> t.Any:
     with tempfile.TemporaryDirectory() as tmpdir:
         input_file = Path(tmpdir) / "input_file"
         async with aiofiles.open(input_file, "wb") as afp:
@@ -435,29 +463,12 @@ async def process_transcribe_message(audio_data: bytes) -> t.Any:
                 content.write(result)
 
         content.seek(0)
+        content_text = content.read().strip()
+        log.debug('transcription result "%s"', content_text)
         return {
             "type": MessageType.TRANSCRIPT.value,
-            "content": content.read().strip(),
+            "content": await process_by_profile(content_text, profile),
         }
-
-
-def get_profiles_config() -> dict[str, t.Any]:
-    with open(os.environ["USE_PROFILES"]) as fp:
-        return yaml.load(fp, yaml.SafeLoader)
-
-
-async def process_by_profile(text: str, profile: str | None) -> str:
-    config = get_profiles_config()
-    profile_config = config["profiles"].get(
-        profile, config["profiles"][config["default"]]
-    )
-    if profile_config["type"] == "openai":
-        params = deepcopy(profile_config["params"])
-        params["prompt"] += text
-        res = await openai.Completion.acreate(**params)
-        if len(res["choices"]) > 0:
-            text = res["choices"][0]["text"].strip()
-    return text
 
 
 @app.websocket("/api/transcribe")
@@ -478,23 +489,61 @@ async def api_transcribe(websocket: WebSocket):
                         {"type": MessageType.PROCEED_WITH_FILE.value}
                     )
                     response = await process_transcribe_message(
-                        await websocket.receive_bytes()
+                        await websocket.receive_bytes(), message.get("profile")
                     )
                 except:
                     log.exception("error decoding transcribe message")
                     continue
 
-                if response["type"] == MessageType.TRANSCRIPT.value:
-                    response["content"] = await process_by_profile(
-                        response["content"], message.get("profile")
-                    )
-
                 await websocket.send_json(response)
             else:
                 log.debug("invalid message")
                 continue
+    except WebSocketDisconnect:
+        log.debug("websocket disconnected")
     finally:
         pass
+
+
+@app.get("/api/transcribe_post")
+async def api_transcribe_post_form():
+    options = "\n".join(
+        f"""<option value="{k}">{v['name']}</option>"""
+        for k, v in get_profiles_config()["profiles"].items()
+    )
+    return Response(
+        f"""
+<doctype html>
+<html>
+    <body>
+        <form action="/api/transcribe_post" enctype="multipart/form-data" method="post">
+            <input name="audio_file" type="file">
+            <select name="profile">
+                {options}
+            </select>
+            <input type="submit">
+        </form>
+    </body>
+</html>
+    """,
+        media_type="text/html",
+    )
+
+
+@app.post("/api/transcribe_post")
+async def api_transcribe_post(
+    audio_file: UploadFile = File(...), profile: str = Form(None)
+):
+    try:
+        return await process_transcribe_message(await audio_file.read(), profile)
+    except Exception as e:
+        log.exception("error decoding transcribe message")
+        if isinstance(e, TranscriptionError):
+            return Response(
+                {"error": str(e.original_exception)},
+                status_code=500,
+            )
+        return Response({"error": "error decoding transcribe message"}, status_code=500)
 
 
 @app.get("/api/profile")
